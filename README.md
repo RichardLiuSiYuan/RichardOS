@@ -1,2 +1,2 @@
-# mikanos
-Educational Operating System
+# richardos
+RichardOS: An Educational Operating System
