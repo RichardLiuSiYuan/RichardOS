@@ -179,6 +179,38 @@ void Halt(void) {
 }
 // #@@range_end(halt)
 
+void CalcLoadAddressRange(Elf64_Ehdr* ehdr, UINT64* first, UINT64* last) {
+  Elf64_Phdr* phdr = (Elf64_Phdr*)((UINT64)ehdr + ehdr->e_phoff);
+  *first = MAX_UINT64;
+  *last = 0;
+  for (Elf64_Half i = 0; i < ehdr->e_phnum; ++i) {
+    if (phdr[i].p_type != PT_LOAD) continue;
+    *first = MIN(*first, phdr[i].p_vaddr);
+    *last = MAX(*last, phdr[i].p_vaddr + phdr[i].p_memsz);
+  }
+}
+
+void CopyLoadSegments(Elf64_Ehdr* ehdr) {
+  // 1. 定位程序段头表（Program Header Table）
+  Elf64_Phdr* phdr = (Elf64_Phdr*)((UINT64)ehdr + ehdr->e_phoff);
+  // 2. 遍历所有程序段
+  for (Elf64_Half i = 0; i < ehdr->e_phnum; ++i) {
+    // 只处理可加载段，跳过其他段（如动态链接、注释段等）
+    if (phdr[i].p_type != PT_LOAD) continue;
+    // 3. 计算该段在 ELF 文件中的起始地址
+    // p_offset：段相对于文件开头的偏移
+    UINT64 segm_in_file = (UINT64)ehdr + phdr[i].p_offset;
+    // 4. 拷贝段数据：文件内容 → 目标虚拟地址
+    // p_vaddr：段运行时虚拟地址；p_filesz：段在文件中的实际字节大小
+    CopyMem((VOID*)phdr[i].p_vaddr, (VOID*)segm_in_file, phdr[i].p_filesz);
+    // 5. 计算内存与文件的差值（BSS 区域：文件无数据、运行时需清零）
+    UINTN remain_bytes = phdr[i].p_memsz - phdr[i].p_filesz;
+    // 从文件数据末尾开始，把剩余内存清零
+    SetMem((VOID*)(phdr[i].p_vaddr + phdr[i].p_filesz), remain_bytes, 0);
+  }
+}
+// #@@range_end(copy_segm_func)
+
 EFI_STATUS EFIAPI UefiMain(
     EFI_HANDLE image_handle,
     EFI_SYSTEM_TABLE* system_table) {
@@ -266,21 +298,49 @@ EFI_STATUS EFIAPI UefiMain(
   UINTN kernel_file_size = file_info->FileSize;
 
   // #@@range_begin(alloc_error)
-  EFI_PHYSICAL_ADDRESS kernel_base_addr = 0x100000;
-  status = gBS->AllocatePages(
-      AllocateAddress, EfiLoaderData,
-      (kernel_file_size + 0xfff) / 0x1000, &kernel_base_addr);
+  // EFI_PHYSICAL_ADDRESS kernel_base_addr = 0x100000;
+  // status = gBS->AllocatePages(
+  //     AllocateAddress, EfiLoaderData,
+  //     (kernel_file_size + 0xfff) / 0x1000, &kernel_base_addr);
+  VOID* kernel_buffer;
+  status = gBS->AllocatePool(EfiLoaderData, kernel_file_size, &kernel_buffer);
   if (EFI_ERROR(status)) {
-    Print(L"failed to allocate pages: %r", status);
+    Print(L"failed to allocate pool: %r", status);
     Halt();
   }
   // #@@range_end(alloc_error)
-  status = kernel_file->Read(kernel_file, &kernel_file_size, (VOID*)kernel_base_addr);
+  //status = kernel_file->Read(kernel_file, &kernel_file_size, (VOID*)kernel_base_addr);
+  status = kernel_file->Read(kernel_file, &kernel_file_size, kernel_buffer);
   if (EFI_ERROR(status)) {
     Print(L"error: %r", status);
     Halt();
   }
-  Print(L"Kernel: 0x%0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
+  //Print(L"Kernel: 0x%0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
+
+  // #@@range_begin(alloc_pages)
+  Elf64_Ehdr* kernel_ehdr = (Elf64_Ehdr*)kernel_buffer;
+  UINT64 kernel_first_addr, kernel_last_addr;
+  CalcLoadAddressRange(kernel_ehdr, &kernel_first_addr, &kernel_last_addr);
+
+  UINTN num_pages = (kernel_last_addr - kernel_first_addr + 0xfff) / 0x1000;
+  status = gBS->AllocatePages(AllocateAddress, EfiLoaderData,
+                              num_pages, &kernel_first_addr);
+  if (EFI_ERROR(status)) {
+    Print(L"failed to allocate pages: %r\n", status);
+    Halt();
+  }
+  // #@@range_end(alloc_pages)
+
+  // #@@range_begin(copy_segments)
+  CopyLoadSegments(kernel_ehdr);
+  Print(L"Kernel: 0x%0lx - 0x%0lx\n", kernel_first_addr, kernel_last_addr);
+
+  status = gBS->FreePool(kernel_buffer);
+  if (EFI_ERROR(status)) {
+    Print(L"failed to free pool: %r\n", status);
+    Halt();
+  }
+  // #@@range_end(copy_segments)
 
   // #@@range_begin(exit_bs)
   status = gBS->ExitBootServices(image_handle, memmap.map_key);
@@ -298,8 +358,11 @@ EFI_STATUS EFIAPI UefiMain(
   }
   // #@@range_end(exit_bs)
 
-  UINT64 entry_addr = *(UINT64*)(kernel_base_addr + 24);
-
+  //UINT64 entry_addr = *(UINT64*)(kernel_base_addr + 24);
+  // #@@range_begin(get_entry_point)
+  UINT64 entry_addr = *(UINT64*)(kernel_first_addr + 24);
+  // #@@range_end(get_entry_point)
+  
   // #@@range_begin(pass_frame_buffer_config)
   struct FrameBufferConfig config = {
     (UINT8*)gop->Mode->FrameBufferBase,
